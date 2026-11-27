@@ -12,7 +12,13 @@ from repowise.core.ingestion.graph import GraphBuilder
 from repowise.core.ingestion.models import FileInfo
 from repowise.core.ingestion.parser import parse_file
 
-_LANG = {".py": "python", ".ts": "typescript", ".js": "javascript"}
+_LANG = {
+    ".py": "python",
+    ".ts": "typescript",
+    ".js": "javascript",
+    ".java": "java",
+    ".kt": "kotlin",
+}
 
 
 def _build(tmp_path: Path, files: dict[str, str]) -> GraphBuilder:
@@ -103,6 +109,121 @@ def test_each_proven_binding_form_is_recorded(
     assert _sites(_build(tmp_path, {rel: src})) == [expected]
 
 
+_JAVA_ORDERS = """\
+import com.acme.billing.BillingClient;
+import com.acme.billing.Api;
+import static com.acme.billing.Charges.refund;
+public class Orders {
+    private BillingClient billing;
+    public void place(String id, Api.Inner inner) {
+        billing.charge(id);
+        refund(id);
+        inner.go();
+    }
+}
+"""
+
+
+def test_a_java_call_is_bound_by_its_declared_type_or_a_static_import(tmp_path: Path) -> None:
+    assert _sites(_build(tmp_path, {"Orders.java": _JAVA_ORDERS})) == [
+        (
+            "Orders.java", 7, "Orders.java::Orders::place",
+            "com.acme.billing.BillingClient", "BillingClient.charge", "named",
+        ),
+        (
+            "Orders.java", 8, "Orders.java::Orders::place",
+            "com.acme.billing.Charges.refund", "Charges.refund", "named",
+        ),
+        (
+            "Orders.java", 9, "Orders.java::Orders::place",
+            "com.acme.billing.Api", "Api.Inner.go", "named",
+        ),
+    ]  # fmt: skip
+
+
+def test_a_kotlin_property_is_bound_by_its_declared_type(tmp_path: Path) -> None:
+    src = (
+        "import com.acme.billing.BillingClient\n"
+        "class Orders(private val billing: BillingClient) {\n"
+        "    fun place(id: String) {\n        billing.charge(id)\n    }\n}\n"
+    )
+    assert _sites(_build(tmp_path, {"Orders.kt": src})) == [
+        (
+            "Orders.kt", 4, "Orders.kt::Orders::place",
+            "com.acme.billing.BillingClient", "BillingClient.charge", "named",
+        )
+    ]  # fmt: skip
+
+
+def test_a_kotlin_call_named_like_an_imported_function_is_not_recorded(tmp_path: Path) -> None:
+    # `chargeTwice` may be an extension of BillingClient or a member of it.
+    src = (
+        "import com.acme.billing.BillingClient\nimport com.acme.billing.ext.chargeTwice\n"
+        "class Orders(private val billing: BillingClient) {\n"
+        "    fun place(id: String) {\n        billing.chargeTwice(id)\n    }\n}\n"
+    )
+    assert _sites(_build(tmp_path, {"Orders.kt": src})) == []
+
+
+def test_a_class_generated_in_a_java_package_of_the_repo_is_repo_code(tmp_path: Path) -> None:
+    files = {
+        "com/me/di/AppComponent.java": "package com.me.di;\npublic interface AppComponent {}\n",
+        "com/app/App.java": (
+            "package com.app;\nimport com.me.di.DaggerAppComponent;\n"
+            "import static com.me.di.DaggerAppComponent.builder;\npublic class App {\n"
+            "    public void start() {\n        DaggerAppComponent.create();\n        builder();\n"
+            "    }\n}\n"
+        ),
+    }
+    assert _sites(_build(tmp_path, files)) == []
+
+
+def test_a_library_under_a_java_package_of_the_repo_stays_a_package(tmp_path: Path) -> None:
+    files = {
+        "com/acme/App.java": (
+            "package com.acme;\nimport com.acme.billing.BillingClient;\npublic class App {\n"
+            "    public void start() {\n        BillingClient.create();\n    }\n}\n"
+        ),
+    }
+    assert [s[3] for s in _sites(_build(tmp_path, files))] == ["com.acme.billing.BillingClient"]
+
+
+def test_a_java_static_import_binds_no_call_on_a_receiver(tmp_path: Path) -> None:
+    # Only a Kotlin extension is called on a receiver.
+    src = (
+        "import com.acme.billing.BillingClient;\nimport static com.acme.util.Util.charge;\n"
+        "public class Orders {\n    private BillingClient billing;\n"
+        "    public void place(String id) {\n        billing.charge(id);\n    }\n}\n"
+    )
+    assert [s[4] for s in _sites(_build(tmp_path, {"Orders.java": src}))] == [
+        "BillingClient.charge"
+    ]
+
+
+def test_a_field_an_ancestor_declares_is_typed_by_the_ancestors_import(tmp_path: Path) -> None:
+    files = {
+        "Base.java": (
+            "import com.acme.billing.BillingClient;\n"
+            "public class Base {\n    protected BillingClient billing;\n}\n"
+        ),
+        # A class of this file named like the type is not the type of Base's field.
+        "Orders.java": (
+            "public class Orders extends Base {\n"
+            "    public void place(String id) {\n        billing.charge(id);\n    }\n}\n"
+            "class BillingClient {}\n"
+        ),
+    }
+    assert [(s[0], s[3], s[4]) for s in _sites(_build(tmp_path, files))] == [
+        ("Orders.java", "com.acme.billing.BillingClient", "BillingClient.charge")
+    ]
+
+
+def test_a_python_annotation_does_not_bind_a_receiver(tmp_path: Path) -> None:
+    # Only a type the compiler checks proves the package.
+    src = "from requests import Session\n\ndef f(s: Session):\n    s.get(1)\n"
+    assert _sites(_build(tmp_path, {"a.py": src})) == []
+
+
 def test_a_parameter_named_like_the_import_is_not_the_package(tmp_path: Path) -> None:
     src = "import requests\n\ndef f(requests):\n    requests.get(1)\n"
     assert _sites(_build(tmp_path, {"a.py": src})) == []
@@ -183,6 +304,7 @@ def test_record_round_trips_and_package_roots() -> None:
     assert package_root("npm", "@s/p/sub") == "@s/p"
     assert package_root("npm", "lodash/merge") == "lodash"
     assert package_root("pypi", "os.path") == "os"
+    assert package_root("maven", "java.util.Map.Entry") == ""
 
 
 def test_a_path_alias_is_never_a_package(tmp_path: Path) -> None:

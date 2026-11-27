@@ -9,7 +9,7 @@ named by its Java name, and an import is read by its target.
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from repowise.core.symbol_spans import enclosing_chains
 
@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
     #: A module an import reaches, the exports it consumes there, and whether its target is one.
     _Reached = tuple[PublishedPackage, list[str], bool]
+    #: A module a join reaches, first, and what the join gives there.
+    _Joined = TypeVar("_Joined", _Reached, tuple[PublishedPackage, str])
 
 #: Kinds that declare members, and so may enclose an exported symbol.
 _TYPE_KINDS = frozenset({"class", "interface", "struct", "enum"})
@@ -364,6 +366,52 @@ def consumed(
     return [(package, names) for package, names, _ in reached]
 
 
+def call_target(module: str, symbol_path: str) -> str:
+    """The full Java name a call reaches: the import *module* and the rest of *symbol_path*.
+
+    A recorded call names its member from the imported name on: an import of
+    ``a.b.Client`` gives ``Client.charge``, and a static import of
+    ``a.b.Charges.refund`` gives ``Charges.refund``. So the two overlap by
+    the names they share, and the longest overlap is taken once.
+    """
+    names, path = module.split("."), symbol_path.split(".") if symbol_path else []
+    width = next((w for w in range(min(len(names), len(path)), 0, -1) if names[-w:] == path[:w]), 0)
+    return ".".join([*names, *path[width:]])
+
+
+def called(
+    java_package: str,
+    rest: str,
+    packages: list[PublishedPackage],
+    surface: CodeSurface,
+    repo: str,
+    depended: Callable[[], Collection[str]],
+) -> list[tuple[PublishedPackage, str]]:
+    """The export a Java or Kotlin call in *repo* reaches, in each module that declares it.
+
+    Only the called member, read as an import's target is: ``A.Companion.make``
+    is ``A.make``, and ``UtilsKt.f`` is the top-level ``f`` of ``Utils.kt``. A
+    member no module exports, such as a method its superclass declares, gives
+    none: a missed consumer, never a wrong one. Where several modules declare
+    it, the call joins those that *depended* names, as an import does.
+    """
+    parts = f"{java_package}.{rest}".split(".")
+    first = java_package.count(".") + 2
+    function = ".".join([*parts[: first - 1], *parts[first:]])
+    out: list[tuple[PublishedPackage, str]] = []
+    for package in packages:
+        if package.repo == repo:
+            continue
+        exported = surface.members[package.name]
+        target = ".".join(_without_companion(parts, first, exported))
+        functions = surface.file_classes.get(package.name, {}).get(".".join(parts[:first]), ())
+        if target in exported:
+            out.append((package, target))
+        elif len(parts) == first + 1 and function in functions:
+            out.append((package, function))
+    return _depended_only(out, depended)
+
+
 def _reached_in(
     java_package: str, rest: str, packages: list[PublishedPackage], surface: CodeSurface
 ) -> list[_Reached]:
@@ -382,8 +430,8 @@ def _reached_in(
 
 
 def _depended_only(
-    reached: list[_Reached], depended: Callable[[], Collection[str]]
-) -> list[_Reached]:
+    reached: list[_Joined], depended: Callable[[], Collection[str]]
+) -> list[_Joined]:
     """Of *reached*, the modules named in *depended*; all of them where it names none.
 
     *depended* is read only where more than one module is reached.

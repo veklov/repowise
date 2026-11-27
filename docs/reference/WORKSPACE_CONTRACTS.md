@@ -330,6 +330,26 @@ export: a field, a constant, an enum constant, a Kotlin property, and the class
 of a file that `@file:JvmName` names. An import of a module of the same
 repository is counted in neither.
 
+A call into a published package is a consumer too, beside the consumer of its
+import, which still holds an export imported and never called. Ingestion records
+each call an import binds to a package (`external_call_sites`), and the call
+consumes the export it names, with its line and calling symbol, so its link
+names the function that calls. A Java or Kotlin call is read by its full name,
+as an import's target is, and consumes the called member only: `billing.charge()`
+on a field `BillingClient billing` consumes `BillingClient.charge`. Where several
+modules declare the member, the call joins those an import joins: the modules
+the calling module depends on, or all of them where it depends on none. In another
+ecosystem a call consumes the export its path names as written
+(`Client.charge`). A call into a submodule or a subpath (`lib.sub.get()`,
+`import { get } from "lib/sub"`) or on a default export names no export, since
+the surface does not say which module of the package declares a name. A call
+that reaches a package and no export of it, such as these or a method a
+superclass declares, is counted in `code_unresolved_calls`. Calls are recorded in Python, JavaScript, TypeScript,
+Java and Kotlin files. A repository whose recorded calls are not complete, or
+with a file of another language that imports a published package (C#, Rust, a
+Vue component), is counted in `code_call_sites_unknown`: unknown, never "not
+called". Two functions of a file that call one export make two links.
+
 The `public_api` flag of the code graph, which the dead-code pass reads for each
 symbol, keeps its own publish rule in `ingestion/graph_warmups.py`, apart from
 the rule above.

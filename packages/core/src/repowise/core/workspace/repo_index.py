@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from repowise.core.ingestion.external_calls import ExternalCallSite
+
 _log = logging.getLogger("repowise.workspace.repo_index")
 
 # Node-id prefix ingestion gives an import target it could not resolve inside
@@ -105,6 +107,7 @@ class RepoIndex:
         self._by_file: dict[str, list[IndexedSymbol]] = {}
         self._by_name: dict[str, list[IndexedSymbol]] = {}
         self._externals: list[ExternalImport] = []
+        self._call_sites: list[ExternalCallSite] | None = None
         self._origins: Mapping[str, str] | None = None
 
     @classmethod
@@ -210,6 +213,17 @@ class RepoIndex:
                     imported_names=tuple(n for n in names if isinstance(n, str)),
                 )
             )
+        await self._load_call_sites(repo_id)
+
+    async def _load_call_sites(self, repo_id: str) -> None:
+        """Read the repo's calls into packages, when the stored rows are complete."""
+        from repowise.core.persistence.crud.external_call_sites import (
+            external_call_sites_complete,
+            list_external_call_sites,
+        )
+
+        if await external_call_sites_complete(self._session, repo_id):
+            self._call_sites = await list_external_call_sites(self._session, repo_id)
 
     # -- Public API --------------------------------------------------------
 
@@ -295,6 +309,11 @@ class RepoIndex:
     def external_import_edges(self) -> list[ExternalImport]:
         """Every ``imports`` edge leaving the repo, with the names it consumes."""
         return self._externals
+
+    def external_call_sites(self) -> list[ExternalCallSite] | None:
+        """Every proven call from the repo into a package, or None when the
+        stored rows are not complete: unknown, never "not called"."""
+        return self._call_sites
 
     def public_symbols(self) -> list[IndexedSymbol]:
         """Symbols ingestion marked public, across the whole repo."""

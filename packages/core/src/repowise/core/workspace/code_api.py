@@ -13,6 +13,8 @@ into its schema — which is what makes the field rules fire on a method. A
 consumer comes from the ``imports`` edges to an ``external:`` target, which
 already name the symbols they bring in. A Java or Kotlin import is read by its
 target path, since the names its edge carries do not tell a member from a type.
+Each call into the package (``external_call_sites``) is a consumer as well, with
+its line and calling symbol, so a link says which function uses which export.
 
 **Published, not merely public.** The surface is what the *manifest* exposes,
 never every public symbol under the package: the two differ by an order of
@@ -42,6 +44,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from repowise.core.fsutils import repo_relative
@@ -53,6 +56,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
     from pathlib import Path
 
+    from repowise.core.ingestion.external_calls import ExternalCallSite
     from repowise.core.workspace.repo_index import (
         ExternalImport,
         IndexedSymbol,
@@ -647,6 +651,7 @@ def build_code_surface(
         rows = surface.by_repo.setdefault(alias, [])
         stats = surface.stats.setdefault(alias, {})
         seen_pairs: set[tuple[str, str, str]] = set()
+        importing: set[str] = set()
         for edge in index.external_import_edges():
             match = _match_import(edge.external_name, by_import)
             if match is None or exclude(edge.source_file):
@@ -656,31 +661,15 @@ def build_code_surface(
             for package, consumed in found:
                 if package.repo == alias:
                     continue
+                importing.add(edge.source_file)
                 for exported in consumed:
                     key = (package.name, exported, edge.source_file)
                     if key in seen_pairs:
                         continue
                     seen_pairs.add(key)
-                    rows.append(
-                        Contract(
-                            repo=alias,
-                            contract_id=contract_id_for(package.name, exported),
-                            contract_type=CODE_CONTRACT_TYPE,
-                            role="consumer",
-                            file_path=edge.source_file,
-                            # Display only. A Maven or Gradle name holds colons
-                            # and a Java name none, so the last colon splits it.
-                            symbol_name=f"{package.name}:{exported}",
-                            confidence=origin_confidence(_ORIGIN),
-                            origin=_ORIGIN,
-                            meta={
-                        "package": package.name,
-                        "ecosystem": package.ecosystem,
-                        EXTRACTION_LAYER_KEY: LAYER_INDEX,
-                    },
-                        )
-                    )
+                    rows.append(_consumer(alias, package, exported, edge.source_file))
         stats["code_consumer_imports"] = len(seen_pairs)
+        rows.extend(_call_consumers(alias, index, by_import, surface, exclude, importing, needs))
 
     _log.debug(
         "Code-API surface: %d package(s), %d contract(s)",
@@ -688,6 +677,168 @@ def build_code_surface(
         sum(len(rows) for rows in surface.by_repo.values()),
     )
     return surface
+
+
+def _consumer(
+    repo: str,
+    package: PublishedPackage,
+    exported: str,
+    file_path: str,
+    *,
+    line: int | None = None,
+    symbol_id: str | None = None,
+) -> Any:
+    """The consumer contract of *exported* in *file_path*, at a call's *line* and *symbol_id*."""
+    from repowise.core.workspace.contracts import Contract
+    from repowise.core.workspace.extractors.from_index import EXTRACTION_LAYER_KEY, LAYER_INDEX
+
+    return Contract(
+        repo=repo,
+        contract_id=contract_id_for(package.name, exported),
+        contract_type=CODE_CONTRACT_TYPE,
+        role="consumer",
+        file_path=file_path,
+        # Display only. A Maven or Gradle name holds colons
+        # and a Java name none, so the last colon splits it.
+        symbol_name=f"{package.name}:{exported}",
+        confidence=origin_confidence(_ORIGIN),
+        origin=_ORIGIN,
+        line=line,
+        symbol_id=symbol_id,
+        meta={
+            "package": package.name,
+            "ecosystem": package.ecosystem,
+            EXTRACTION_LAYER_KEY: LAYER_INDEX,
+        },
+    )
+
+
+def _call_consumers(
+    repo: str,
+    index: RepoIndex,
+    by_import: Mapping[str, list[PublishedPackage]],
+    surface: CodeSurface,
+    exclude: Callable[[str], bool],
+    importing: Collection[str],
+    needs: code_api_jvm.ModuleNeeds,
+) -> list[Any]:
+    """One consumer for each call from *repo* into a published package.
+
+    Next to the import's consumers, which still hold an export imported and
+    never called. A repo whose calls are not all recorded is counted in
+    ``code_call_sites_unknown``: unknown, never "not called". Its stored calls
+    are not complete, or one of the files in *importing*, which import a
+    published package, is of a language whose calls ingestion does not record.
+    A call that reaches a package and no export of it is counted in
+    ``code_unresolved_calls``.
+    """
+    stats = surface.stats.setdefault(repo, {})
+    sites = index.external_call_sites()
+    if _calls_unknown(sites, importing):
+        stats["code_call_sites_unknown"] = 1
+    # Two calls on one line of one function may reach one export (through an alias).
+    rows: dict[tuple[str, str, str, int, str], Any] = {}
+    for site in sites or ():
+        if exclude(site.file_path):
+            continue
+        depended = partial(needs.of, repo, site.file_path)
+        for package, exported in _counted(_called(site, by_import, surface, repo, depended), stats):
+            key = (package.name, exported, site.file_path, site.line, site.caller_symbol_id)
+            rows[key] = _consumer(
+                repo, package, exported, site.file_path,
+                line=site.line, symbol_id=site.caller_symbol_id,
+            )  # fmt: skip
+    stats["code_consumer_calls"] = len(rows)
+    return list(rows.values())
+
+
+def _counted(
+    found: list[tuple[PublishedPackage, str]] | None, stats: dict[str, int]
+) -> list[tuple[PublishedPackage, str]]:
+    """*found*, with a call that reaches a package and no export of it counted."""
+    if found == []:
+        stats["code_unresolved_calls"] = stats.get("code_unresolved_calls", 0) + 1
+    return found or []
+
+
+def _calls_unknown(sites: list[ExternalCallSite] | None, importing: Collection[str]) -> bool:
+    """Whether a repo's calls are not all recorded: its stored calls are not
+    complete, or a file of *importing* is of a language whose calls are not
+    recorded. The language is read from the suffix, so a script that only its
+    first line names counts as unknown."""
+    from repowise.core.ingestion.external_calls import EXTERNAL_CALL_ECOSYSTEMS
+    from repowise.core.ingestion.languages.registry import REGISTRY
+
+    if sites is None:
+        return True
+    return any(
+        REGISTRY.from_extension(PurePosixPath(path).suffix.lower())
+        not in EXTERNAL_CALL_ECOSYSTEMS
+        for path in importing
+    )
+
+
+def _called(
+    site: ExternalCallSite,
+    by_import: Mapping[str, list[PublishedPackage]],
+    surface: CodeSurface,
+    repo: str,
+    depended: Callable[[], Collection[str]],
+) -> list[tuple[PublishedPackage, str]] | None:
+    """The export *site* calls in each package of another repo, or None when it
+    reaches no such package. *depended* gives the names of the packages the
+    calling module depends on (:meth:`.code_api_jvm.ModuleNeeds.of`)."""
+    if site.ecosystem == "maven":
+        return _called_jvm(site, by_import, surface, repo, depended)
+    return _called_by_path(site, by_import, surface, repo)
+
+
+def _called_jvm(
+    site: ExternalCallSite,
+    by_import: Mapping[str, list[PublishedPackage]],
+    surface: CodeSurface,
+    repo: str,
+    depended: Callable[[], Collection[str]],
+) -> list[tuple[PublishedPackage, str]] | None:
+    """A Java or Kotlin call, read by its full name as an import's target is."""
+    match = _match_import(code_api_jvm.call_target(site.module, site.symbol_path), by_import)
+    packages = [p for p in by_import[match[0]] if p.repo != repo] if match else []
+    if not match or not packages:
+        return None
+    return code_api_jvm.called(*match, packages, surface, repo, depended)
+
+
+def _called_by_path(
+    site: ExternalCallSite,
+    by_import: Mapping[str, list[PublishedPackage]],
+    surface: CodeSurface,
+    repo: str,
+) -> list[tuple[PublishedPackage, str]] | None:
+    """The export a call of another ecosystem names: its path as written, a name
+    or ``Owner.member``. A call into a submodule or a subpath (``lib.sub.get()``,
+    ``import { get } from "lib/sub"``) or on a default export names no export,
+    since the surface does not say which module of the package declares a name.
+    """
+    found = _package_of(site, by_import, repo)
+    if found is None:
+        return None
+    package, rest = found
+    exported = surface.members[package.name]
+    return [(package, site.symbol_path)] if not rest and site.symbol_path in exported else []
+
+
+def _package_of(
+    site: ExternalCallSite, by_import: Mapping[str, list[PublishedPackage]], repo: str
+) -> tuple[PublishedPackage, str] | None:
+    """The package of another repo, of the call's ecosystem, that the call's module
+    names, and the submodule or subpath of it that follows the import name."""
+    match = _match_import(site.module, by_import)
+    if match is None:
+        return None
+    package = by_import[match[0]][0]
+    if package.repo == repo or package.ecosystem != site.ecosystem:
+        return None
+    return package, match[1]
 
 
 def _import_names(ecosystem: str, name: str, entry_files: frozenset[str] | None) -> frozenset[str]:
